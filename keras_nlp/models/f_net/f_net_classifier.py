@@ -12,20 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.backend import keras
+from keras_nlp.models.classifier import Classifier
 from keras_nlp.models.f_net.f_net_backbone import FNetBackbone
 from keras_nlp.models.f_net.f_net_backbone import f_net_kernel_initializer
 from keras_nlp.models.f_net.f_net_preprocessor import FNetPreprocessor
-from keras_nlp.models.f_net.f_net_presets import backbone_presets
-from keras_nlp.models.task import Task
-from keras_nlp.utils.python_utils import classproperty
 
 
 @keras_nlp_export("keras_nlp.models.FNetClassifier")
-class FNetClassifier(Task):
+class FNetClassifier(Classifier):
     """An end-to-end f_net model for classification tasks.
 
     This model attaches a classification head to a
@@ -100,6 +97,9 @@ class FNetClassifier(Task):
     ```
     """
 
+    backbone_cls = FNetBackbone
+    preprocessor_cls = FNetPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -141,17 +141,6 @@ class FNetClassifier(Task):
         self.activation = keras.activations.get(activation)
         self.dropout = dropout
 
-        # === Default compilation ===
-        logit_output = self.activation == keras.activations.linear
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(
-                from_logits=logit_output
-            ),
-            optimizer=keras.optimizers.Adam(5e-5),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
     def get_config(self):
         config = super().get_config()
         config.update(
@@ -162,15 +151,3 @@ class FNetClassifier(Task):
             }
         )
         return config
-
-    @classproperty
-    def backbone_cls(cls):
-        return FNetBackbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return FNetPreprocessor
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)

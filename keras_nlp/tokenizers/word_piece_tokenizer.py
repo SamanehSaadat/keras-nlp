@@ -13,17 +13,14 @@
 # limitations under the License.
 
 import os
+import re
 from typing import Iterable
-from typing import List
 
+import keras
 import tensorflow as tf
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.tokenizers import tokenizer
-from keras_nlp.utils.preset_utils import check_preset_class
-from keras_nlp.utils.preset_utils import load_from_preset
-from keras_nlp.utils.python_utils import classproperty
-from keras_nlp.utils.python_utils import format_docstring
 from keras_nlp.utils.tensor_utils import assert_tf_text_installed
 from keras_nlp.utils.tensor_utils import convert_to_ragged_batch
 from keras_nlp.utils.tensor_utils import is_int_dtype
@@ -101,12 +98,19 @@ WHITESPACE_PUNCTUATION_AND_CJK_REGEX = r"|".join(
 )
 
 
+def get_special_tokens_pattern(special_tokens):
+    if special_tokens is None or len(special_tokens) == 0:
+        return None
+    return r"|".join([re.escape(token) for token in special_tokens])
+
+
 def pretokenize(
     text,
     lowercase=False,
     strip_accents=True,
     split=True,
     split_on_cjk=True,
+    special_tokens_pattern=None,
 ):
     """Helper function that takes in a dataset element and pretokenizes it.
 
@@ -124,7 +128,14 @@ def pretokenize(
         split_on_cjk: bool. If `True`, input will be split
             on CJK characters, i.e., Chinese, Japanese, Korean and Vietnamese
             characters (https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)).
-            Note that this is applicable only when `split` is `True`. Defaults to `True`.
+            Note that this is applicable only when `split` is `True`. Defaults
+            to `True`.
+        special_tokens_pattern: str. A regex pattern that contain the
+            special tokens that will never be split during the word-level
+            splitting applied before the word-peice encoding. This can be used
+            to ensure special tokens map to unique indices in the vocabulary,
+            even if these special tokens contain splittable characters such as
+            punctuation.
 
     Returns:
         A tensor containing the pre-processed and pre-tokenized `text`.
@@ -140,8 +151,6 @@ def pretokenize(
         text = tf.expand_dims(text, 0)
     if split_on_cjk and split:
         text = tf.strings.regex_replace(text, CJK_REGEX, r" \0 ")
-    if lowercase:
-        text = tf_text.case_fold_utf8(text)
     if strip_accents:
         # Normalize unicode to NFD, which splits out accent mark characters.
         text = tf_text.normalize_utf8(text, "NFD")
@@ -154,11 +163,40 @@ def pretokenize(
         else:
             split_pattern = WHITESPACE_AND_PUNCTUATION_REGEX
             keep_split_pattern = PUNCTUATION_REGEX
+        if special_tokens_pattern is not None:
+            # the idea here is to pass the special tokens regex to the split
+            # function as delimiter regex pattern, so the input will be splitted
+            # by them, but also the function will treat each on of them as one
+            # entity that shouldn't be splitted even if they have other
+            # delimiter regex pattern inside them. then pass the special tokens
+            # regex also as keep delimiter regex pattern, so they will
+            # not be removed.
+            split_pattern = r"|".join(
+                [
+                    special_tokens_pattern,
+                    split_pattern,
+                ]
+            )
+            keep_split_pattern = r"|".join(
+                [special_tokens_pattern, keep_split_pattern]
+            )
         text = tf_text.regex_split(
             text,
             delim_regex_pattern=split_pattern,
             keep_delim_regex_pattern=keep_split_pattern,
         )
+    if lowercase:
+        if special_tokens_pattern is not None:
+            # Do not lowercase special tokens in string space. They often
+            # contain capital letters, e.g. `"[CLS]"`.
+            mask = (
+                tf.strings.regex_replace(text, special_tokens_pattern, "६")
+                == "६"
+            )
+            text = tf.where(mask, text, tf_text.case_fold_utf8(text))
+        else:
+            text = tf_text.case_fold_utf8(text)
+
     return text
 
 
@@ -225,6 +263,15 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
         oov_token: str. The string value to substitute for
             an unknown token. It must be included in the vocab.
             Defaults to `"[UNK]"`.
+        special_tokens: list. A list of special tokens. when
+            `special_tokens_in_strings` is set to `True`, the tokenizer will map
+            every special token in the input strings to its id, even if these
+            special tokens contain characters that should be splitted before
+            tokenization such as punctuation. `special_tokens` must be included
+            in `vocabulary`.
+        special_tokens_in_strings: bool. A bool to indicate if the tokenizer
+            should expect special tokens in input strings that should be
+            tokenized and mapped correctly to their ids. Defaults to False.
 
     References:
      - [Schuster and Nakajima, 2012](https://research.google/pubs/pub37842/)
@@ -296,13 +343,15 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
     def __init__(
         self,
         vocabulary=None,
-        sequence_length: int = None,
-        lowercase: bool = False,
-        strip_accents: bool = False,
-        split: bool = True,
-        split_on_cjk: bool = True,
-        suffix_indicator: str = "##",
-        oov_token: str = "[UNK]",
+        sequence_length=None,
+        lowercase=False,
+        strip_accents=False,
+        split=True,
+        split_on_cjk=True,
+        suffix_indicator="##",
+        oov_token="[UNK]",
+        special_tokens=None,
+        special_tokens_in_strings=False,
         dtype="int32",
         **kwargs,
     ) -> None:
@@ -325,7 +374,21 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
         self.split_on_cjk = split_on_cjk
         self.suffix_indicator = suffix_indicator
         self.oov_token = oov_token
+        self.special_tokens = special_tokens
+        self._special_tokens_pattern = None
+        if self.split and special_tokens_in_strings:
+            # the idea here is to pass the special tokens regex to the
+            # split function as delimiter regex pattern, so the input will
+            # be splitted by them, but also the function will treat each on
+            # of them as one entity that shouldn't be splitted even if they
+            # have other delimiter regex pattern inside them. then pass the
+            # special tokens regex also as keep delimiter regex
+            # pattern, so they will not be removed.
+            self._special_tokens_pattern = get_special_tokens_pattern(
+                self.special_tokens
+            )
         self.set_vocabulary(vocabulary)
+        self.file_assets = [VOCAB_FILENAME]
 
     def save_assets(self, dir_path):
         path = os.path.join(dir_path, VOCAB_FILENAME)
@@ -365,6 +428,16 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
                 "the `oov_token` argument when creating the tokenizer."
             )
 
+        # Check for special tokens in the vocabulary
+        if self.special_tokens is not None:
+            for token in self.special_tokens:
+                if token not in self.vocabulary:
+                    raise ValueError(
+                        f"Cannot find token `'{token}'` in the provided "
+                        f"`vocabulary`. Please provide `'{token}'` in your "
+                        "`vocabulary` or use a pretrained `vocabulary` name."
+                    )
+
         self._fast_word_piece = tf_text.FastWordpieceTokenizer(
             vocab=self.vocabulary,
             token_out_type=self.compute_dtype,
@@ -374,17 +447,17 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
             support_detokenization=True,
         )
 
-    def get_vocabulary(self) -> List[str]:
+    def get_vocabulary(self):
         """Get the tokenizer vocabulary as a list of strings tokens."""
         self._check_vocabulary()
         return self.vocabulary
 
-    def vocabulary_size(self) -> int:
-        """Get the size of the tokenizer vocabulary."""
+    def vocabulary_size(self):
+        """Get the integer size of the tokenizer vocabulary."""
         self._check_vocabulary()
         return len(self.vocabulary)
 
-    def id_to_token(self, id: int) -> str:
+    def id_to_token(self, id):
         """Convert an integer id to a string token."""
         self._check_vocabulary()
         if id >= self.vocabulary_size() or id < 0:
@@ -394,7 +467,7 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
             )
         return self.vocabulary[id]
 
-    def token_to_id(self, token: str) -> int:
+    def token_to_id(self, token):
         """Convert a string token to an integer id."""
         # This will be slow, but keep memory usage down compared to building a
         # . Assuming the main use case is looking up a few special tokens
@@ -413,6 +486,7 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
                 "split": self.split,
                 "suffix_indicator": self.suffix_indicator,
                 "oov_token": self.oov_token,
+                "special_tokens": self.special_tokens,
             }
         )
         return config
@@ -436,6 +510,7 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
             self.strip_accents,
             self.split,
             self.split_on_cjk,
+            self._special_tokens_pattern,
         )
 
         # Apply WordPiece and coerce shape for outputs.
@@ -465,66 +540,7 @@ class WordPieceTokenizer(tokenizer.Tokenizer):
             outputs = tf.squeeze(outputs, 0)
         return outputs
 
-    @classproperty
-    def presets(cls):
-        return {}
-
-    @classmethod
-    def from_preset(
-        cls,
-        preset,
-        **kwargs,
-    ):
-        """Instantiate {{model_name}} tokenizer from preset vocabulary.
-
-        Args:
-            preset: string. Must be one of "{{preset_names}}".
-
-        Examples:
-        ```python
-        # Load a preset tokenizer.
-        tokenizer = {{model_name}}.from_preset("{{example_preset_name}}")
-
-        # Tokenize some input.
-        tokenizer("The quick brown fox tripped.")
-
-        # Detokenize some input.
-        tokenizer.detokenize([5, 6, 7, 8, 9])
-        ```
-        """
-        # We support short IDs for official presets, e.g. `"bert_base_en"`.
-        # Map these to a Kaggle Models handle.
-        if preset in cls.presets:
-            preset = cls.presets[preset]["kaggle_handle"]
-
-        config_file = "tokenizer.json"
-        check_preset_class(preset, cls, config_file=config_file)
-        return load_from_preset(
-            preset,
-            config_file=config_file,
-            config_overrides=kwargs,
+    def compute_output_spec(self, input_spec):
+        return keras.KerasTensor(
+            input_spec.shape + (self.sequence_length,), dtype=self.compute_dtype
         )
-
-    def __init_subclass__(cls, **kwargs):
-        # Use __init_subclass__ to setup a correct docstring for from_preset.
-        super().__init_subclass__(**kwargs)
-
-        # If the subclass does not define from_preset, assign a wrapper so that
-        # each class can have a distinct docstring.
-        if "from_preset" not in cls.__dict__:
-
-            def from_preset(calling_cls, *args, **kwargs):
-                return super(cls, calling_cls).from_preset(*args, **kwargs)
-
-            cls.from_preset = classmethod(from_preset)
-
-        # Format and assign the docstring unless the subclass has overridden it.
-        if cls.from_preset.__doc__ is None:
-            cls.from_preset.__func__.__doc__ = (
-                WordPieceTokenizer.from_preset.__doc__
-            )
-            format_docstring(
-                model_name=cls.__name__,
-                example_preset_name=next(iter(cls.presets), ""),
-                preset_names='", "'.join(cls.presets),
-            )(cls.from_preset.__func__)

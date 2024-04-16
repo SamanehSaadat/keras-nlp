@@ -12,19 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.backend import keras
 from keras_nlp.layers.preprocessing.preprocessing_layer import (
     PreprocessingLayer,
 )
-from keras_nlp.utils.preset_utils import check_preset_class
-from keras_nlp.utils.preset_utils import load_from_preset
+from keras_nlp.utils.preset_utils import PREPROCESSOR_CONFIG_FILE
+from keras_nlp.utils.preset_utils import TOKENIZER_CONFIG_FILE
+from keras_nlp.utils.preset_utils import check_config_class
+from keras_nlp.utils.preset_utils import check_file_exists
+from keras_nlp.utils.preset_utils import list_presets
+from keras_nlp.utils.preset_utils import list_subclasses
+from keras_nlp.utils.preset_utils import load_serialized_object
+from keras_nlp.utils.preset_utils import save_serialized_object
 from keras_nlp.utils.python_utils import classproperty
-from keras_nlp.utils.python_utils import format_docstring
 
 
-@keras.saving.register_keras_serializable(package="keras_nlp")
+@keras_nlp_export("keras_nlp.models.Preprocessor")
 class Preprocessor(PreprocessingLayer):
-    """Base class for model preprocessors."""
+    """Base class for preprocessing layers.
+
+    A `Preprocessor` layer wraps a `keras_nlp.tokenizer.Tokenizer` to provide a
+    complete preprocessing setup for a given task. For example a masked language
+    modeling preprocessor will take in raw input strings, and output
+    `(x, y, sample_weight)` tuples. Where `x` contains token id sequences with
+    some
+
+    This class can be subclassed similar to any `keras.layers.Layer`, by
+    defining `build()`, `call()` and `get_config()` methods. All subclasses
+    should set the `tokenizer` property on construction.
+    """
+
+    tokenizer_cls = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,12 +76,14 @@ class Preprocessor(PreprocessingLayer):
         return cls(**config)
 
     @classproperty
-    def tokenizer_cls(cls):
-        return None
-
-    @classproperty
     def presets(cls):
-        return {}
+        presets = list_presets(cls)
+        # We can also load backbone presets.
+        if cls.tokenizer_cls is not None:
+            presets.update(cls.tokenizer_cls.presets)
+        for subclass in list_subclasses(cls):
+            presets.update(subclass.presets)
+        return presets
 
     @classmethod
     def from_preset(
@@ -70,50 +91,107 @@ class Preprocessor(PreprocessingLayer):
         preset,
         **kwargs,
     ):
-        """Instantiate {{preprocessor_name}} from preset architecture.
+        """Instantiate a `keras_nlp.models.Preprocessor` from a model preset.
+
+        A preset is a directory of configs, weights and other file assets used
+        to save and load a pre-trained model. The `preset` can be passed as a
+        one of:
+
+        1. a built in preset identifier like `'bert_base_en'`
+        2. a Kaggle Models handle like `'kaggle://user/bert/keras/bert_base_en'`
+        3. a Hugging Face handle like `'hf://user/bert_base_en'`
+        4. a path to a local preset directory like `'./bert_base_en'`
+
+        For any `Preprocessor` subclass, you can run `cls.presets.keys()` to
+        list all built-in presets available on the class.
+
+        As there are usually multiple preprocessing classes for a given model,
+        this method should be called on a specific subclass like
+        `keras_nlp.models.BertPreprocessor.from_preset()`.
 
         Args:
-            preset: string. Must be one of "{{preset_names}}".
+            preset: string. A built in preset identifier, a Kaggle Models
+                handle, a Hugging Face handle, or a path to a local directory.
 
         Examples:
         ```python
-        # Load a preprocessor layer from a preset.
-        preprocessor = keras_nlp.models.{{preprocessor_name}}.from_preset(
-            "{{example_preset_name}}",
+        # Load a preprocessor for Gemma generation.
+        preprocessor = keras_nlp.models.GemmaCausalLMPreprocessor.from_preset(
+            "gemma_2b_en",
+        )
+
+        # Load a preprocessor for Bert classification.
+        preprocessor = keras_nlp.models.BertPreprocessor.from_preset(
+            "bert_base_en",
         )
         ```
         """
-        # We support short IDs for official presets, e.g. `"bert_base_en"`.
-        # Map these to a Kaggle Models handle.
-        if preset in cls.presets:
-            preset = cls.presets[preset]["kaggle_handle"]
+        if cls == Preprocessor:
+            raise ValueError(
+                "Do not call `Preprocessor.from_preset()` directly. Instead call a "
+                "choose a particular task class, e.g. "
+                "`keras_nlp.models.BertPreprocessor.from_preset()`."
+            )
+        # Check if we should load a `preprocessor.json` directly.
+        load_preprocessor_config = False
+        if check_file_exists(preset, PREPROCESSOR_CONFIG_FILE):
+            preprocessor_preset_cls = check_config_class(
+                preset, PREPROCESSOR_CONFIG_FILE
+            )
+            if issubclass(preprocessor_preset_cls, cls):
+                load_preprocessor_config = True
+        if load_preprocessor_config:
+            # Preprocessor case.
+            preprocessor = load_serialized_object(
+                preset,
+                PREPROCESSOR_CONFIG_FILE,
+            )
+            preprocessor.tokenizer.load_preset_assets(preset)
+            return preprocessor
 
-        config_file = "tokenizer.json"
-        check_preset_class(preset, cls.tokenizer_cls, config_file=config_file)
-        tokenizer = load_from_preset(
-            preset,
-            config_file=config_file,
+        # Tokenizer case.
+        # If `preprocessor.json` doesn't exist or preprocessor preset class is
+        # different from the calling class, create the preprocessor based on
+        # `tokenizer.json`.
+        tokenizer_preset_cls = check_config_class(
+            preset, config_file=TOKENIZER_CONFIG_FILE
         )
-        return cls(tokenizer=tokenizer, **kwargs)
+        if tokenizer_preset_cls is not cls.tokenizer_cls:
+            subclasses = list_subclasses(cls)
+            subclasses = tuple(
+                filter(
+                    lambda x: x.tokenizer_cls == tokenizer_preset_cls,
+                    subclasses,
+                )
+            )
+            if len(subclasses) == 0:
+                raise ValueError(
+                    f"No registered subclass of `{cls.__name__}` can load "
+                    f"a `{tokenizer_preset_cls.__name__}`."
+                )
+            if len(subclasses) > 1:
+                names = ", ".join(f"`{x.__name__}`" for x in subclasses)
+                raise ValueError(
+                    f"Ambiguous call to `{cls.__name__}.from_preset()`. "
+                    f"Found multiple possible subclasses {names}. "
+                    "Please call `from_preset` on a subclass directly."
+                )
 
-    def __init_subclass__(cls, **kwargs):
-        # Use __init_subclass__ to setup a correct docstring for from_preset.
-        super().__init_subclass__(**kwargs)
+        tokenizer = load_serialized_object(preset, TOKENIZER_CONFIG_FILE)
+        tokenizer.load_preset_assets(preset)
+        preprocessor = cls(tokenizer=tokenizer)
 
-        # If the subclass does not define from_preset, assign a wrapper so that
-        # each class can have a distinct docstring.
-        if "from_preset" not in cls.__dict__:
+        return preprocessor
 
-            def from_preset(calling_cls, *args, **kwargs):
-                return super(cls, calling_cls).from_preset(*args, **kwargs)
+    def save_to_preset(self, preset_dir):
+        """Save preprocessor to a preset directory.
 
-            cls.from_preset = classmethod(from_preset)
-
-        # Format and assign the docstring unless the subclass has overridden it.
-        if cls.from_preset.__doc__ is None:
-            cls.from_preset.__func__.__doc__ = Preprocessor.from_preset.__doc__
-            format_docstring(
-                preprocessor_name=cls.__name__,
-                example_preset_name=next(iter(cls.presets), ""),
-                preset_names='", "'.join(cls.presets),
-            )(cls.from_preset.__func__)
+        Args:
+            preset_dir: The path to the local model preset directory.
+        """
+        save_serialized_object(
+            self,
+            preset_dir,
+            config_file=PREPROCESSOR_CONFIG_FILE,
+        )
+        self.tokenizer.save_to_preset(preset_dir)

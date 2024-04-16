@@ -12,22 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 from keras_nlp.api_export import keras_nlp_export
-from keras_nlp.backend import keras
 from keras_nlp.backend import ops
 from keras_nlp.models.bart.bart_backbone import BartBackbone
-from keras_nlp.models.bart.bart_presets import backbone_presets
 from keras_nlp.models.bart.bart_seq_2_seq_lm_preprocessor import (
     BartSeq2SeqLMPreprocessor,
 )
-from keras_nlp.models.generative_task import GenerativeTask
-from keras_nlp.utils.python_utils import classproperty
+from keras_nlp.models.seq_2_seq_lm import Seq2SeqLM
+from keras_nlp.utils.tensor_utils import any_equal
 
 
 @keras_nlp_export("keras_nlp.models.BartSeq2SeqLM")
-class BartSeq2SeqLM(GenerativeTask):
+class BartSeq2SeqLM(Seq2SeqLM):
     """An end-to-end BART model for seq2seq language modeling.
 
     A seq2seq language model (LM) is an encoder-decoder model which is used for
@@ -179,6 +176,9 @@ class BartSeq2SeqLM(GenerativeTask):
     ```
     """
 
+    backbone_cls = BartBackbone
+    preprocessor_cls = BartSeq2SeqLMPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -198,26 +198,6 @@ class BartSeq2SeqLM(GenerativeTask):
             outputs=outputs,
             **kwargs,
         )
-
-        # === Default compilation ===
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            optimizer=keras.optimizers.Adam(2e-5),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)
-
-    @classproperty
-    def backbone_cls(cls):
-        return BartBackbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return BartSeq2SeqLMPreprocessor
 
     def call_decoder_with_cache(
         self,
@@ -398,7 +378,7 @@ class BartSeq2SeqLM(GenerativeTask):
     def generate_step(
         self,
         inputs,
-        end_token_id=None,
+        stop_token_ids=None,
     ):
         """A compilable generation function for a batch of inputs.
 
@@ -412,8 +392,8 @@ class BartSeq2SeqLM(GenerativeTask):
             inputs: A dictionary with four keys - `"encoder_token_ids"`,
                 `"encoder_padding_mask"`, `"decoder_token_ids"` and
                 `"decoder_padding_mask"`, with batched tensor values.
-            end_token_id: The id of the end token to stop on. If all
-                sequences have produced a new `end_token_id`, generation
+            stop_token_ids: Tuple of id's of end token's to stop on. If all
+                sequences have produced a new stop token, generation
                 will stop.
         """
         (
@@ -471,23 +451,24 @@ class BartSeq2SeqLM(GenerativeTask):
                 cache,
             )
 
-        decoder_token_ids = self._sampler(
+        decoder_token_ids = self.sampler(
             next=next,
             prompt=decoder_token_ids,
             cache=self_attention_cache,
             index=index,
             mask=decoder_padding_mask,
-            end_token_id=end_token_id,
+            stop_token_ids=stop_token_ids,
             hidden_states=hidden_states,
             model=self,
         )
 
         # Compute an output padding mask with the token ids we updated.
-        if end_token_id is not None:
-            # Build a mask of `end_token_id` locations not in the original
+        if stop_token_ids is not None:
+            # Build a mask of `stop_token_ids` locations not in the original
             # prompt (not in locations where `decoder_padding_mask` is True).
-            end_locations = ops.logical_and(
-                ops.equal(decoder_token_ids, end_token_id),
+            end_locations = any_equal(
+                decoder_token_ids,
+                stop_token_ids,
                 ops.logical_not(decoder_padding_mask),
             )
             end_locations = ops.cast(end_locations, "int32")

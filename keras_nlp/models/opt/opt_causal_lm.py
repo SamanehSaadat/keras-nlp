@@ -12,22 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 from keras_nlp.api_export import keras_nlp_export
-from keras_nlp.backend import keras
 from keras_nlp.backend import ops
-from keras_nlp.models.generative_task import GenerativeTask
+from keras_nlp.models.causal_lm import CausalLM
 from keras_nlp.models.opt.opt_backbone import OPTBackbone
 from keras_nlp.models.opt.opt_causal_lm_preprocessor import (
     OPTCausalLMPreprocessor,
 )
-from keras_nlp.models.opt.opt_presets import backbone_presets
-from keras_nlp.utils.python_utils import classproperty
+from keras_nlp.utils.tensor_utils import any_equal
 
 
 @keras_nlp_export("keras_nlp.models.OPTCausalLM")
-class OPTCausalLM(GenerativeTask):
+class OPTCausalLM(CausalLM):
     """An end-to-end OPT model for causal language modeling.
 
     A causal language model (LM) predicts the next token based on previous
@@ -149,6 +146,9 @@ class OPTCausalLM(GenerativeTask):
     ```
     """
 
+    backbone_cls = OPTBackbone
+    preprocessor_cls = OPTCausalLMPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -168,26 +168,6 @@ class OPTCausalLM(GenerativeTask):
             outputs=outputs,
             **kwargs,
         )
-
-        # === Default compilation ===
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            optimizer=keras.optimizers.Adam(2e-5),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)
-
-    @classproperty
-    def backbone_cls(cls):
-        return OPTBackbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return OPTCausalLMPreprocessor
 
     def call_with_cache(
         self,
@@ -247,7 +227,7 @@ class OPTCausalLM(GenerativeTask):
     def generate_step(
         self,
         inputs,
-        end_token_id=None,
+        stop_token_ids=None,
     ):
         """A compilable generation function for a single batch of inputs.
 
@@ -258,8 +238,8 @@ class OPTCausalLM(GenerativeTask):
         Args:
             inputs: A dictionary with two keys `"token_ids"` and
                 `"padding_mask"` and batched tensor values.
-            end_token_id: The id of the end token to stop on. If all
-                sequences have produced a new `end_token_id`, generation
+            stop_token_ids: Tuple of id's of end token's to stop on. If all
+                sequences have produced a new stop token, generation
                 will stop.
         """
         token_ids, padding_mask = inputs["token_ids"], inputs["padding_mask"]
@@ -286,25 +266,25 @@ class OPTCausalLM(GenerativeTask):
                 cache,
             )
 
-        token_ids = self._sampler(
+        token_ids = self.sampler(
             next=next,
             prompt=token_ids,
             cache=cache,
             index=index,
             mask=padding_mask,
-            end_token_id=end_token_id,
+            stop_token_ids=stop_token_ids,
             hidden_states=hidden_states,
             model=self,
         )
 
         # Compute an output padding mask with the token ids we updated.
-        if end_token_id is not None:
-            # Build a mask of `end_token_id` locations not in the original
+        if stop_token_ids is not None:
+            # Build a mask of stop token locations not in the original
             # prompt (not in locations where `padding_mask` is True).
-            end_locations = ops.logical_and(
-                ops.equal(token_ids, end_token_id),
-                ops.logical_not(padding_mask),
+            end_locations = any_equal(
+                token_ids, stop_token_ids, ops.logical_not(padding_mask)
             )
+
             end_locations = ops.cast(end_locations, "int32")
             # Use cumsum to get ones in all locations after end_locations.
             cumsum = ops.cast(ops.cumsum(end_locations, axis=-1), "int32")

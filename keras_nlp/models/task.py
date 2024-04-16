@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from rich import console as rich_console
 from rich import markup
 from rich import table as rich_table
@@ -21,15 +23,43 @@ from keras_nlp.backend import config
 from keras_nlp.backend import keras
 from keras_nlp.utils.keras_utils import print_msg
 from keras_nlp.utils.pipeline_model import PipelineModel
-from keras_nlp.utils.preset_utils import check_preset_class
-from keras_nlp.utils.preset_utils import load_from_preset
+from keras_nlp.utils.preset_utils import CONFIG_FILE
+from keras_nlp.utils.preset_utils import MODEL_WEIGHTS_FILE
+from keras_nlp.utils.preset_utils import TASK_CONFIG_FILE
+from keras_nlp.utils.preset_utils import TASK_WEIGHTS_FILE
+from keras_nlp.utils.preset_utils import check_config_class
+from keras_nlp.utils.preset_utils import check_file_exists
+from keras_nlp.utils.preset_utils import get_file
+from keras_nlp.utils.preset_utils import jax_memory_cleanup
+from keras_nlp.utils.preset_utils import list_presets
+from keras_nlp.utils.preset_utils import list_subclasses
+from keras_nlp.utils.preset_utils import load_serialized_object
+from keras_nlp.utils.preset_utils import save_serialized_object
 from keras_nlp.utils.python_utils import classproperty
-from keras_nlp.utils.python_utils import format_docstring
 
 
 @keras_nlp_export("keras_nlp.models.Task")
 class Task(PipelineModel):
-    """Base class for Task models."""
+    """Base class for all Task models.
+
+    A `Task` wraps a `keras_nlp.models.Backbone` and
+    a `keras_nlp.models.Preprocessor` to create a model that can be directly
+    used for training, fine-tuning, and prediction for a given text problem.
+
+    All `Task` models have `backbone` and `preprocessor` properties. By
+    default `fit()`, `predict()` and `evaluate()` will preprocess all inputs
+    automatically. To preprocess inputs separately or with a custom function,
+    you can set `task.preprocessor = None`, which disable any automatic
+    preprocessing on inputs.
+
+    All `Task` classes include a `from_preset()` constructor which can be used
+    to load a pre-trained config and weights. Calling `from_preset()` on a task
+    will automatically instantiate a `keras_nlp.models.Backbone` and
+    `keras_nlp.models.Preprocessor`.
+    """
+
+    backbone_cls = None
+    preprocessor_cls = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -62,56 +92,6 @@ class Task(PipelineModel):
 
         return filter(filter_fn, super().__dir__())
 
-    def _check_for_loss_mismatch(self, loss):
-        """Check for a softmax/from_logits mismatch after compile.
-
-        We cannot handle this in the general case, but we can handle this for
-        the extremely common case of a single `SparseCategoricalCrossentropy`
-        loss, and a `None` or `"softmax"` activation.
-        """
-        # Only handle a single loss.
-        if isinstance(loss, (dict, list, tuple)):
-            return
-        # Only handle tasks with activation.
-        if not hasattr(self, "activation"):
-            return
-
-        loss = keras.losses.get(loss)
-        activation = keras.activations.get(self.activation)
-        if isinstance(loss, keras.losses.SparseCategoricalCrossentropy):
-            from_logits = loss.get_config()["from_logits"]
-        elif loss == keras.losses.sparse_categorical_crossentropy:
-            from_logits = False
-        else:
-            # Only handle sparse categorical crossentropy.
-            return
-
-        softmax_output = activation == keras.activations.softmax
-        logit_output = activation == keras.activations.linear
-        if softmax_output and from_logits:
-            raise ValueError(
-                "The `loss` passed to `compile()` expects logit output, but "
-                "the model is configured to output softmax probabilities "
-                "(`activation='softmax'`). This will not converge! Pass "
-                "`from_logits=False` to your loss, e.g. "
-                "`loss=keras.losses.SparseCategoricalCrossentropy(from_logits=False)`. "
-            )
-        if logit_output and not from_logits:
-            raise ValueError(
-                "The `loss` passed to `compile()` expects softmax probability "
-                "output, but the model is configured to output logits "
-                "(`activation=None`). This will not converge! Pass "
-                "`from_logits=True` to your loss, e.g. "
-                "`loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True)`. "
-            )
-
-    def compile(self, optimizer="rmsprop", loss=None, **kwargs):
-        # Temporarily disable jit compilation on torch.
-        if config.backend() == "torch":
-            kwargs["jit_compile"] = False
-        self._check_for_loss_mismatch(loss)
-        super().compile(optimizer=optimizer, loss=loss, **kwargs)
-
     def preprocess_samples(self, x, y=None, sample_weight=None):
         if self.preprocessor is not None:
             return self.preprocessor(x, y=y, sample_weight=sample_weight)
@@ -134,7 +114,7 @@ class Task(PipelineModel):
 
     @property
     def backbone(self):
-        """A `keras.Model` instance providing the backbone sub-model."""
+        """A `keras_nlp.models.Backbone` model with the core architecture."""
         return getattr(self, "_backbone", None)
 
     @backbone.setter
@@ -143,7 +123,7 @@ class Task(PipelineModel):
 
     @property
     def preprocessor(self):
-        """A `keras.layers.Layer` instance used to preprocess inputs."""
+        """A `keras_nlp.models.Preprocessor` layer used to preprocess input."""
         return getattr(self, "_preprocessor", None)
 
     @preprocessor.setter
@@ -174,16 +154,15 @@ class Task(PipelineModel):
         return cls(**config)
 
     @classproperty
-    def backbone_cls(cls):
-        return None
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return None
-
-    @classproperty
     def presets(cls):
-        return {}
+        """List built-in presets for a `Task` subclass."""
+        presets = list_presets(cls)
+        # We can also load backbone presets.
+        if cls.backbone_cls is not None:
+            presets.update(cls.backbone_cls.presets)
+        for subclass in list_subclasses(cls):
+            presets.update(subclass.presets)
+        return presets
 
     @classmethod
     def from_preset(
@@ -192,25 +171,54 @@ class Task(PipelineModel):
         load_weights=True,
         **kwargs,
     ):
-        """Instantiate {{model_task_name}} model from preset architecture and weights.
+        """Instantiate a `keras_nlp.models.Task` from a model preset.
+
+        A preset is a directory of configs, weights and other file assets used
+        to save and load a pre-trained model. The `preset` can be passed as a
+        one of:
+
+        1. a built in preset identifier like `'bert_base_en'`
+        2. a Kaggle Models handle like `'kaggle://user/bert/keras/bert_base_en'`
+        3. a Hugging Face handle like `'hf://user/bert_base_en'`
+        4. a path to a local preset directory like `'./bert_base_en'`
+
+        For any `Task` subclass, you can run `cls.presets.keys()` to list all
+        built-in presets available on the class.
+
+        This constructor can be called in one of two ways. Either from a task
+        specific base class like `keras_nlp.models.CausalLM.from_preset()`, or
+        from a model class like `keras_nlp.models.BertClassifier.from_preset()`.
+        If calling from the a base class, the subclass of the returning object
+        will be inferred from the config in the preset directory.
 
         Args:
-            preset: string. Must be one of "{{preset_names}}".
-            load_weights: Whether to load pre-trained weights into model.
-                Defaults to `True`.
+            preset: string. A built in preset identifier, a Kaggle Models
+                handle, a Hugging Face handle, or a path to a local directory.
+            load_weights: bool. If `True`, the weights will be loaded into the
+                model architecture. If `False`, the weights will be randomly
+                initialized.
 
         Examples:
         ```python
-        # Load architecture and weights from preset
-        model = {{model_task_name}}.from_preset("{{example_preset_name}}")
+        # Load a Gemma generative task.
+        causal_lm = keras_nlp.models.CausalLM.from_preset(
+            "gemma_2b_en",
+        )
 
-        # Load randomly initialized model from preset architecture
-        model = {{model_task_name}}.from_preset(
-            "{{example_preset_name}}",
-            load_weights=False
+        # Load a Bert classification task.
+        model = keras_nlp.models.Classifier.from_preset(
+            "bert_base_en",
+            num_classes=2,
         )
         ```
         """
+        if cls == Task:
+            raise ValueError(
+                "Do not call `Task.from_preset()` directly. Instead call a "
+                "particular task class, e.g. "
+                "`keras_nlp.models.Classifier.from_preset()` or "
+                "`keras_nlp.models.BertClassifier.from_preset()`."
+            )
         if "backbone" in kwargs:
             raise ValueError(
                 "You cannot pass a `backbone` argument to the `from_preset` "
@@ -218,62 +226,117 @@ class Task(PipelineModel):
                 "constructor with a `backbone` argument. "
                 f"Received: backbone={kwargs['backbone']}."
             )
-        # We support short IDs for official presets, e.g. `"bert_base_en"`.
-        # Map these to a Kaggle Models handle.
-        if preset in cls.presets:
-            preset = cls.presets[preset]["kaggle_handle"]
 
-        preset_cls = check_preset_class(preset, (cls, cls.backbone_cls))
+        # Check if we should load a `task.json` directly.
+        load_task_config = False
+        if check_file_exists(preset, TASK_CONFIG_FILE):
+            task_preset_cls = check_config_class(preset, TASK_CONFIG_FILE)
+            if issubclass(task_preset_cls, cls):
+                load_task_config = True
+        if load_task_config:
+            # Task case.
+            task_preset_cls = check_config_class(preset, TASK_CONFIG_FILE)
+            task = load_serialized_object(preset, TASK_CONFIG_FILE)
+            if load_weights:
+                jax_memory_cleanup(task)
+                if check_file_exists(preset, TASK_WEIGHTS_FILE):
+                    task.load_task_weights(get_file(preset, TASK_WEIGHTS_FILE))
+                task.backbone.load_weights(get_file(preset, MODEL_WEIGHTS_FILE))
+            task.preprocessor.tokenizer.load_preset_assets(preset)
+            return task
 
         # Backbone case.
-        if preset_cls == cls.backbone_cls:
-            # Forward dtype to the backbone.
-            config_overrides = {}
-            if "dtype" in kwargs:
-                config_overrides["dtype"] = kwargs.pop("dtype")
-            backbone = load_from_preset(
-                preset,
-                load_weights=load_weights,
-                config_overrides=config_overrides,
-            )
-            if "preprocessor" in kwargs:
-                preprocessor = kwargs.pop("preprocessor")
-            else:
-                tokenizer = load_from_preset(
-                    preset,
-                    config_file="tokenizer.json",
+        # If `task.json` doesn't exist or the task preset class is different
+        # from the calling class, create the task based on `config.json`.
+        backbone_preset_cls = check_config_class(preset, CONFIG_FILE)
+        if backbone_preset_cls is not cls.backbone_cls:
+            subclasses = list_subclasses(cls)
+            subclasses = tuple(
+                filter(
+                    lambda x: x.backbone_cls == backbone_preset_cls,
+                    subclasses,
                 )
-                preprocessor = cls.preprocessor_cls(tokenizer=tokenizer)
-            return cls(backbone=backbone, preprocessor=preprocessor, **kwargs)
-
-        # Task case.
-        return load_from_preset(
+            )
+            if len(subclasses) == 0:
+                raise ValueError(
+                    f"No registered subclass of `{cls.__name__}` can load "
+                    f"a `{backbone_preset_cls.__name__}`."
+                )
+            if len(subclasses) > 1:
+                names = ", ".join(f"`{x.__name__}`" for x in subclasses)
+                raise ValueError(
+                    f"Ambiguous call to `{cls.__name__}.from_preset()`. "
+                    f"Found multiple possible subclasses {names}. "
+                    "Please call `from_preset` on a subclass directly."
+                )
+            cls = subclasses[0]
+        # Forward dtype to the backbone.
+        config_overrides = {}
+        if "dtype" in kwargs:
+            config_overrides["dtype"] = kwargs.pop("dtype")
+        backbone = backbone_preset_cls.from_preset(
             preset,
             load_weights=load_weights,
-            config_overrides=kwargs,
+            config_overrides=config_overrides,
+        )
+        preprocessor = cls.preprocessor_cls.from_preset(preset)
+        return cls(backbone=backbone, preprocessor=preprocessor, **kwargs)
+
+    def load_task_weights(self, filepath):
+        """Load only the tasks specific weights not in the backbone."""
+        if not str(filepath).endswith(".weights.h5"):
+            raise ValueError(
+                "The filename must end in `.weights.h5`. Received: filepath={filepath}"
+            )
+        backbone_layer_ids = set(id(w) for w in self.backbone._flatten_layers())
+        keras.saving.load_weights(
+            self,
+            filepath,
+            objects_to_skip=backbone_layer_ids,
         )
 
-    def __init_subclass__(cls, **kwargs):
-        # Use __init_subclass__ to setup a correct docstring for from_preset.
-        super().__init_subclass__(**kwargs)
+    def has_task_weights(self):
+        task_weight_ids = set(id(w) for w in self.weights)
+        backbone_weight_ids = set(id(w) for w in self.backbone.weights)
+        return not task_weight_ids.issubset(backbone_weight_ids)
 
-        # If the subclass does not define `from_preset`, assign a wrapper so that
-        # each class can have a distinct docstring.
-        if "from_preset" not in cls.__dict__:
+    def save_task_weights(self, filepath):
+        """Save only the tasks specific weights not in the backbone."""
+        if not str(filepath).endswith(".weights.h5"):
+            raise ValueError(
+                "The filename must end in `.weights.h5`. "
+                f"Received: filepath={filepath}"
+            )
 
-            def from_preset(calling_cls, *args, **kwargs):
-                return super(cls, calling_cls).from_preset(*args, **kwargs)
+        backbone_layer_ids = set(id(w) for w in self.backbone._flatten_layers())
+        if not self.has_task_weights():
+            raise ValueError(
+                f"Task {self} has no weights not in the `backbone`. "
+                "`save_task_weights()` has nothing to save."
+            )
+        keras.saving.save_weights(
+            self,
+            filepath=filepath,
+            objects_to_skip=backbone_layer_ids,
+        )
 
-            cls.from_preset = classmethod(from_preset)
+    def save_to_preset(self, preset_dir):
+        """Save task to a preset directory.
 
-        # Format and assign the docstring unless the subclass has overridden it.
-        if cls.from_preset.__doc__ is None:
-            cls.from_preset.__func__.__doc__ = Task.from_preset.__doc__
-            format_docstring(
-                model_task_name=cls.__name__,
-                example_preset_name=next(iter(cls.presets), ""),
-                preset_names='", "'.join(cls.presets),
-            )(cls.from_preset.__func__)
+        Args:
+            preset_dir: The path to the local model preset directory.
+        """
+        if self.preprocessor is None:
+            raise ValueError(
+                "Cannot save `task` to preset: `Preprocessor` is not initialized."
+            )
+
+        save_serialized_object(self, preset_dir, config_file=TASK_CONFIG_FILE)
+        if self.has_task_weights():
+            self.save_task_weights(os.path.join(preset_dir, TASK_WEIGHTS_FILE))
+
+        self.preprocessor.save_to_preset(preset_dir)
+        self.backbone.save_to_preset(preset_dir)
 
     @property
     def layers(self):

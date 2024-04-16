@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.backend import keras
 from keras_nlp.layers.modeling.masked_lm_head import MaskedLMHead
@@ -22,13 +20,11 @@ from keras_nlp.models.bert.bert_backbone import bert_kernel_initializer
 from keras_nlp.models.bert.bert_masked_lm_preprocessor import (
     BertMaskedLMPreprocessor,
 )
-from keras_nlp.models.bert.bert_presets import backbone_presets
-from keras_nlp.models.task import Task
-from keras_nlp.utils.python_utils import classproperty
+from keras_nlp.models.masked_lm import MaskedLM
 
 
 @keras_nlp_export("keras_nlp.models.BertMaskedLM")
-class BertMaskedLM(Task):
+class BertMaskedLM(MaskedLM):
     """An end-to-end BERT model for the masked language modeling task.
 
     This model will train BERT on a masked language modeling task.
@@ -51,7 +47,7 @@ class BertMaskedLM(Task):
             `None`. If `None`, this model will not apply preprocessing, and
             inputs should be preprocessed before calling the model.
 
-    Example usage:
+    Examples:
 
     Raw string data.
     ```python
@@ -95,6 +91,9 @@ class BertMaskedLM(Task):
     ```
     """
 
+    backbone_cls = BertBackbone
+    preprocessor_cls = BertMaskedLMPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -129,25 +128,3 @@ class BertMaskedLM(Task):
             outputs=outputs,
             **kwargs,
         )
-
-        # === Default compilation ===
-        self.backbone = backbone
-        self.preprocessor = preprocessor
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            optimizer=keras.optimizers.Adam(5e-5),
-            weighted_metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
-    @classproperty
-    def backbone_cls(cls):
-        return BertBackbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return BertMaskedLMPreprocessor
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)

@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from keras_nlp.backend import keras
-from keras_nlp.models.preprocessor import Preprocessor
-from keras_nlp.models.task import Task
+from keras_nlp.models import CausalLM
+from keras_nlp.models import Preprocessor
+from keras_nlp.models import Task
+from keras_nlp.models import Tokenizer
+from keras_nlp.models.bert.bert_classifier import BertClassifier
+from keras_nlp.models.gpt2.gpt2_causal_lm import GPT2CausalLM
 from keras_nlp.tests.test_case import TestCase
-from keras_nlp.tokenizers.tokenizer import Tokenizer
 
 
 class SimpleTokenizer(Tokenizer):
@@ -40,56 +45,40 @@ class SimpleTask(Task):
 
 
 class TestTask(TestCase):
+    def test_preset_accessors(self):
+        bert_presets = set(BertClassifier.presets.keys())
+        gpt2_presets = set(GPT2CausalLM.presets.keys())
+        all_presets = set(Task.presets.keys())
+        self.assertContainsSubset(bert_presets, all_presets)
+        self.assertContainsSubset(gpt2_presets, all_presets)
+
+    @pytest.mark.large
+    def test_from_preset(self):
+        self.assertIsInstance(
+            CausalLM.from_preset("gpt2_base_en", load_weights=False),
+            GPT2CausalLM,
+        )
+        # TODO: Add a classifier task loading test when there is a classifier
+        # with new design available on Kaggle.
+
+    @pytest.mark.large
+    def test_from_preset_errors(self):
+        with self.assertRaises(ValueError):
+            # No loading on a task directly (it is ambiguous).
+            Task.from_preset("bert_tiny_en_uncased", load_weights=False)
+        with self.assertRaises(ValueError):
+            # No loading on an incorrect class.
+            BertClassifier.from_preset("gpt2_base_en", load_weights=False)
+
     def test_summary_with_preprocessor(self):
         preprocessor = SimplePreprocessor()
         model = SimpleTask(preprocessor)
         summary = []
-        model.summary(print_fn=lambda x, line_break: summary.append(x))
+        model.summary(print_fn=lambda x, line_break=False: summary.append(x))
         self.assertRegex("\n".join(summary), "Preprocessor:")
 
     def test_summary_without_preprocessor(self):
         model = SimpleTask()
         summary = []
-        model.summary(print_fn=lambda x, line_break: summary.append(x))
+        model.summary(print_fn=lambda x, line_break=False: summary.append(x))
         self.assertNotRegex("\n".join(summary), "Preprocessor:")
-
-    def test_mismatched_loss(self):
-        # Logit output.
-        model = SimpleTask(activation=None)
-        model.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-        )
-        # Non-standard losses should not throw.
-        model.compile(loss="mean_squared_error")
-        with self.assertRaises(ValueError):
-            model.compile(loss="sparse_categorical_crossentropy")
-        with self.assertRaises(ValueError):
-            model.compile(
-                loss=keras.losses.SparseCategoricalCrossentropy(
-                    from_logits=False
-                )
-            )
-
-        # Probability output.
-        model = SimpleTask(activation="softmax")
-        model.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=False)
-        )
-        model.compile(loss="sparse_categorical_crossentropy")
-        # Non-standard losses should not throw.
-        model.compile(loss="mean_squared_error")
-        with self.assertRaises(ValueError):
-            model.compile(
-                loss=keras.losses.SparseCategoricalCrossentropy(
-                    from_logits=True
-                )
-            )
-
-        # Non-standard activations should not throw.
-        model = SimpleTask(activation="tanh")
-        model.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-        )
-        model.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=False)
-        )

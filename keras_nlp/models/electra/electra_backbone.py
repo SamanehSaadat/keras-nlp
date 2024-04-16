@@ -36,8 +36,9 @@ class ElectraBackbone(Backbone):
     or classification task networks.
 
     The default constructor gives a fully customizable, randomly initialized
-    Electra encoder with any number of layers, heads, and embedding
-    dimensions.
+    ELECTRA encoder with any number of layers, heads, and embedding
+    dimensions. To load preset architectures and weights, use the
+    `from_preset()` constructor.
 
     Disclaimer: Pre-trained models are provided on an "as is" basis, without
     warranties or conditions of any kind. The underlying model is provided by a
@@ -63,13 +64,20 @@ class ElectraBackbone(Backbone):
             such as softmax and layer normalization, will always be done at
             float32 precision regardless of dtype.
 
-    Examples:
+    Example:
         ```python
         input_data = {
         "token_ids": np.ones(shape=(1, 12), dtype="int32"),
         "segment_ids": np.array([[0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0]]),
         "padding_mask": np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]]),
         }
+
+        # Pre-trained ELECTRA encoder.
+        model = keras_nlp.models.ElectraBackbone.from_preset(
+            "electra_base_discriminator_en"
+        )
+        model(input_data)
+
         # Randomly initialized Electra encoder
         backbone = keras_nlp.models.ElectraBackbone(
             vocabulary_size=1000,

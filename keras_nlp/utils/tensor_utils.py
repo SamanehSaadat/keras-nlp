@@ -65,7 +65,9 @@ def convert_to_backend_tensor_or_python_list(x):
     """
     if isinstance(x, tf.RaggedTensor) or getattr(x, "dtype", None) == tf.string:
         return tensor_to_list(x)
-    return ops.convert_to_tensor(x)
+    dtype = getattr(x, "dtype", "float32")
+    dtype = standardize_dtype(dtype)
+    return ops.convert_to_tensor(x, dtype=dtype)
 
 
 def convert_to_ragged_batch(inputs):
@@ -170,3 +172,27 @@ def is_int_dtype(dtype):
 
 def is_string_dtype(dtype):
     return "string" in standardize_dtype(dtype)
+
+
+def any_equal(inputs, values, padding_mask):
+    """Return a mask that is True anywhere `inputs` has a value in `values`.
+
+    Final mask has `padding_mask` applied.
+
+    Args:
+        inputs: Input tensor.
+        values: List or iterable of tensors shaped like `inputs` or broadcastable
+            by bit operators.
+        padding_mask: Tensor with shape compatible with inputs that will condition
+            output.
+
+    Returns:
+        A tensor with `inputs` shape where each position is True if it contains
+            a value from any `values`. Padding mask will be applied before
+            returning."""
+    output = ops.equal(inputs, values[0])
+    for value in values[1:]:
+        value_equality = ops.equal(inputs, value)
+        output = ops.logical_or(output, value_equality)
+
+    return ops.logical_and(output, padding_mask)

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.backend import keras
+from keras_nlp.models.classifier import Classifier
 from keras_nlp.models.distil_bert.distil_bert_backbone import DistilBertBackbone
 from keras_nlp.models.distil_bert.distil_bert_backbone import (
     distilbert_kernel_initializer,
@@ -23,13 +23,10 @@ from keras_nlp.models.distil_bert.distil_bert_backbone import (
 from keras_nlp.models.distil_bert.distil_bert_preprocessor import (
     DistilBertPreprocessor,
 )
-from keras_nlp.models.distil_bert.distil_bert_presets import backbone_presets
-from keras_nlp.models.task import Task
-from keras_nlp.utils.python_utils import classproperty
 
 
 @keras_nlp_export("keras_nlp.models.DistilBertClassifier")
-class DistilBertClassifier(Task):
+class DistilBertClassifier(Classifier):
     """An end-to-end DistilBERT model for classification tasks.
 
     This model attaches a classification head to a
@@ -140,6 +137,9 @@ class DistilBertClassifier(Task):
     ```
     """
 
+    backbone_cls = DistilBertBackbone
+    preprocessor_cls = DistilBertPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -192,17 +192,6 @@ class DistilBertClassifier(Task):
         self.hidden_dim = hidden_dim
         self.dropout = dropout
 
-        # === Default compilation ===
-        logit_output = self.activation == keras.activations.linear
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(
-                from_logits=logit_output
-            ),
-            optimizer=keras.optimizers.Adam(5e-5),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
     def get_config(self):
         config = super().get_config()
         config.update(
@@ -214,15 +203,3 @@ class DistilBertClassifier(Task):
             }
         )
         return config
-
-    @classproperty
-    def backbone_cls(cls):
-        return DistilBertBackbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return DistilBertPreprocessor
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)

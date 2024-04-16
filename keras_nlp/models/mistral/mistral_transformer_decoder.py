@@ -102,7 +102,6 @@ class MistralTransformerDecoder(keras.layers.Layer):
 
         self._feedforward_gate_dense = keras.layers.Dense(
             self.intermediate_dim,
-            activation=self.activation,
             kernel_initializer=clone_initializer(self.kernel_initializer),
             use_bias=False,
             dtype=self.dtype_policy,
@@ -172,6 +171,17 @@ class MistralTransformerDecoder(keras.layers.Layer):
         x = self._feedforward_layernorm(x)
         gate_output = self._feedforward_gate_dense(x)
 
+        # Note that we run the activation function in full 32-bit
+        # precision since this is what `torch.nn.functional.silu`
+        # does. Internally, `torch.nn.functional.silu` converts the
+        # inputs to float32, computes SiLU, and converts the outputs
+        # back to compute dtype.
+        # CPU Kernel: https://github.com/pytorch/pytorch/blob/35c493f2cf9b623bfdc7e6b34dc1cb39690a7919/aten/src/ATen/native/cpu/Activation.cpp#L1221-L1235  # noqa: E501
+        # CUDA Kernel: https://github.com/pytorch/pytorch/blob/35c493f2cf9b623bfdc7e6b34dc1cb39690a7919/aten/src/ATen/native/cuda/ActivationSiluKernel.cu  # noqa: E501
+        gate_output = ops.cast(gate_output, "float32")
+        gate_output = self.activation(gate_output)
+        gate_output = ops.cast(gate_output, self.compute_dtype)
+
         x = self._feedforward_intermediate_dense(x)
 
         x = self._feedforward_output_dense(ops.multiply(x, gate_output))
@@ -207,17 +217,20 @@ class MistralTransformerDecoder(keras.layers.Layer):
             else self_attention_cache_update_index
         )
 
-        # Mistral uses a banded attention mask
-        causal_mask_lower = compute_causal_mask(
+        # The lower traingular attention mask
+        causal_mask = compute_causal_mask(
             batch_size, input_length, output_length, cache_update_index
         )
-        # Below is a workaround for `ops.triu` for Keras 2.
-        # TODO(tirthasheshpatel): Use `ops.triu` once Keras 2 support is removed.
-        # causal_mask = ops.triu(causal_mask_lower, k=-self.sliding_window)
-        i = ops.arange(output_length)[:, None] + cache_update_index
-        j = ops.arange(input_length)[None, :]
-        causal_mask_upper = ops.cast(i < j + self.sliding_window, "int32")
-        causal_mask = ops.minimum(causal_mask_lower, causal_mask_upper)
+
+        # Mistral uses a banded attention mask if sliding window is not None
+        if self.sliding_window is not None:
+            # Below is a workaround for `ops.triu` for Keras 2.
+            # TODO(tirthasheshpatel): Use `ops.triu` once Keras 2 support is removed.
+            # causal_mask = ops.triu(causal_mask, k=-self.sliding_window)
+            i = ops.arange(output_length)[:, None] + cache_update_index
+            j = ops.arange(input_length)[None, :]
+            causal_mask_upper = ops.cast(i < j + self.sliding_window, "int32")
+            causal_mask = ops.minimum(causal_mask, causal_mask_upper)
 
         return (
             ops.minimum(decoder_mask, causal_mask)

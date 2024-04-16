@@ -22,17 +22,13 @@ but is TF graph compatible.
 import json
 import os
 from typing import Iterable
-from typing import List
 
+import keras
 import regex as re
 import tensorflow as tf
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.tokenizers import tokenizer
-from keras_nlp.utils.preset_utils import check_preset_class
-from keras_nlp.utils.preset_utils import load_from_preset
-from keras_nlp.utils.python_utils import classproperty
-from keras_nlp.utils.python_utils import format_docstring
 from keras_nlp.utils.tensor_utils import assert_tf_text_installed
 from keras_nlp.utils.tensor_utils import convert_to_ragged_batch
 from keras_nlp.utils.tensor_utils import is_int_dtype
@@ -149,7 +145,7 @@ class BytePairTokenizerCache(tf.Module):
     The cache key is string tensor or python strings, and the value is split
     tokens joined by whitespace. For example, "dragonfly" => "dragon fly"
 
-    Examples:
+    Example:
     ```
     cache = BytePairTokenizerCache()
     cache.insert(["butterfly", "dragonfly"], ["but ter fly", "dragon fly"])
@@ -298,6 +294,7 @@ class BytePairTokenizer(tokenizer.Tokenizer):
         self.sequence_length = sequence_length
         self.add_prefix_space = add_prefix_space
         self.unsplittable_tokens = unsplittable_tokens
+        self.file_assets = [VOCAB_FILENAME, MERGES_FILENAME]
 
         # Create byte <=> unicode mapping. This is useful for handling
         # whitespace tokens.
@@ -391,17 +388,17 @@ class BytePairTokenizer(tokenizer.Tokenizer):
             default=self.merge_ranks_lookup_default,
         )
 
-    def get_vocabulary(self) -> List[str]:
+    def get_vocabulary(self):
         """Get the tokenizer vocabulary as a list of strings tokens."""
         self._check_vocabulary()
         return self.vocabulary.keys()
 
-    def vocabulary_size(self) -> int:
-        """Get the size of the tokenizer vocabulary."""
+    def vocabulary_size(self):
+        """Get the integer size of the tokenizer vocabulary."""
         self._check_vocabulary()
         return len(self.vocabulary)
 
-    def id_to_token(self, id: int) -> str:
+    def id_to_token(self, id):
         """Convert an integer id to a string token."""
         # This will be slow, but keep memory usage down compared to building a
         # dict. Assuming the main use case is looking up a few special tokens
@@ -414,7 +411,7 @@ class BytePairTokenizer(tokenizer.Tokenizer):
                 return token
         raise ValueError(f"`id` is out of the vocabulary. Received: {id}")
 
-    def token_to_id(self, token: str) -> int:
+    def token_to_id(self, token):
         """Convert a string token to an integer id."""
         self._check_vocabulary()
         return self.vocabulary[token]
@@ -609,6 +606,11 @@ class BytePairTokenizer(tokenizer.Tokenizer):
             outputs = tf.squeeze(outputs, 0)
         return outputs
 
+    def compute_output_spec(self, input_spec):
+        return keras.KerasTensor(
+            input_spec.shape + (self.sequence_length,), dtype=self.compute_dtype
+        )
+
     def _transform_bytes(self, tokens):
         """Map token bytes to unicode using `byte2unicode`."""
         split_bytes = tf.strings.bytes_split(tokens)
@@ -637,67 +639,3 @@ class BytePairTokenizer(tokenizer.Tokenizer):
             }
         )
         return config
-
-    @classproperty
-    def presets(cls):
-        return {}
-
-    @classmethod
-    def from_preset(
-        cls,
-        preset,
-        **kwargs,
-    ):
-        """Instantiate {{model_name}} tokenizer from preset vocabulary.
-
-        Args:
-            preset: string. Must be one of "{{preset_names}}".
-
-        Examples:
-        ```python
-        # Load a preset tokenizer.
-        tokenizer = {{model_name}}.from_preset("{{example_preset_name}}")
-
-        # Tokenize some input.
-        tokenizer("The quick brown fox tripped.")
-
-        # Detokenize some input.
-        tokenizer.detokenize([5, 6, 7, 8, 9])
-        ```
-        """
-        # We support short IDs for official presets, e.g. `"bert_base_en"`.
-        # Map these to a Kaggle Models handle.
-        if preset in cls.presets:
-            preset = cls.presets[preset]["kaggle_handle"]
-
-        config_file = "tokenizer.json"
-        check_preset_class(preset, cls, config_file=config_file)
-        return load_from_preset(
-            preset,
-            config_file=config_file,
-            config_overrides=kwargs,
-        )
-
-    def __init_subclass__(cls, **kwargs):
-        # Use __init_subclass__ to setup a correct docstring for from_preset.
-        super().__init_subclass__(**kwargs)
-
-        # If the subclass does not define from_preset, assign a wrapper so that
-        # each class can have a distinct docstring.
-        if "from_preset" not in cls.__dict__:
-
-            def from_preset(calling_cls, *args, **kwargs):
-                return super(cls, calling_cls).from_preset(*args, **kwargs)
-
-            cls.from_preset = classmethod(from_preset)
-
-        # Format and assign the docstring unless the subclass has overridden it.
-        if cls.from_preset.__doc__ is None:
-            cls.from_preset.__func__.__doc__ = (
-                BytePairTokenizer.from_preset.__doc__
-            )
-            format_docstring(
-                model_name=cls.__name__,
-                example_preset_name=next(iter(cls.presets), ""),
-                preset_names='", "'.join(cls.presets),
-            )(cls.from_preset.__func__)

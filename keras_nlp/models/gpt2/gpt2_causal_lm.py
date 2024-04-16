@@ -12,22 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.backend import keras
 from keras_nlp.backend import ops
-from keras_nlp.models.generative_task import GenerativeTask
+from keras_nlp.models.causal_lm import CausalLM
 from keras_nlp.models.gpt2.gpt2_backbone import GPT2Backbone
 from keras_nlp.models.gpt2.gpt2_causal_lm_preprocessor import (
     GPT2CausalLMPreprocessor,
 )
-from keras_nlp.models.gpt2.gpt2_presets import backbone_presets
-from keras_nlp.utils.python_utils import classproperty
+from keras_nlp.utils.tensor_utils import any_equal
 
 
 @keras_nlp_export("keras_nlp.models.GPT2CausalLM")
-class GPT2CausalLM(GenerativeTask):
+class GPT2CausalLM(CausalLM):
     """An end-to-end GPT2 model for causal language modeling.
 
     A causal language model (LM) predicts the next token based on previous
@@ -149,6 +147,9 @@ class GPT2CausalLM(GenerativeTask):
     ```
     """
 
+    backbone_cls = GPT2Backbone
+    preprocessor_cls = GPT2CausalLMPreprocessor
+
     def __init__(
         self,
         backbone,
@@ -168,26 +169,6 @@ class GPT2CausalLM(GenerativeTask):
             outputs=outputs,
             **kwargs,
         )
-
-        # === Default compilation ===
-        self.compile(
-            loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            optimizer=keras.optimizers.Adam(2e-5),
-            metrics=[keras.metrics.SparseCategoricalAccuracy()],
-            jit_compile=True,
-        )
-
-    @classproperty
-    def presets(cls):
-        return copy.deepcopy(backbone_presets)
-
-    @classproperty
-    def backbone_cls(cls):
-        return GPT2Backbone
-
-    @classproperty
-    def preprocessor_cls(cls):
-        return GPT2CausalLMPreprocessor
 
     def call_with_cache(
         self,
@@ -251,7 +232,7 @@ class GPT2CausalLM(GenerativeTask):
     def generate_step(
         self,
         inputs,
-        end_token_id=None,
+        stop_token_ids=None,
     ):
         """A compilable generation function for a single batch of inputs.
 
@@ -262,8 +243,8 @@ class GPT2CausalLM(GenerativeTask):
         Args:
             inputs: A dictionary with two keys `"token_ids"` and
                 `"padding_mask"` and batched tensor values.
-            end_token_id: The id of the end token to stop on. If all
-                sequences have produced a new `end_token_id`, generation
+            stop_token_ids: List of id's of end token's to stop on. If all
+                sequences have produced a new stop token, generation
                 will stop.
         """
         token_ids, padding_mask = inputs["token_ids"], inputs["padding_mask"]
@@ -290,25 +271,25 @@ class GPT2CausalLM(GenerativeTask):
                 cache,
             )
 
-        token_ids = self._sampler(
+        token_ids = self.sampler(
             next=next,
             prompt=token_ids,
             cache=cache,
             index=index,
             mask=padding_mask,
-            end_token_id=end_token_id,
+            stop_token_ids=stop_token_ids,
             hidden_states=hidden_states,
             model=self,
         )
 
         # Compute an output padding mask with the token ids we updated.
-        if end_token_id is not None:
-            # Build a mask of `end_token_id` locations not in the original
+        if stop_token_ids is not None:
+            # Build a mask of stop tokens locations not in the original
             # prompt (not in locations where `padding_mask` is True).
-            end_locations = ops.logical_and(
-                ops.equal(token_ids, end_token_id),
-                ops.logical_not(padding_mask),
+            end_locations = any_equal(
+                token_ids, stop_token_ids, ops.logical_not(padding_mask)
             )
+
             end_locations = ops.cast(end_locations, "int32")
             # Use cumsum to get ones in all locations after end_locations.
             cumsum = ops.cast(ops.cumsum(end_locations, axis=-1), "int32")
@@ -322,3 +303,134 @@ class GPT2CausalLM(GenerativeTask):
             "token_ids": token_ids,
             "padding_mask": padding_mask,
         }
+
+    def score(
+        self,
+        token_ids,
+        padding_mask=None,
+        scoring_mode="logits",
+        layer_intercept_fn=None,
+        target_ids=None,
+    ):
+        """Score a generation represented by the provided token ids.
+
+        Args:
+            token_ids: A <int>[batch_size, num_tokens] tensor containing tokens
+                to score. Typically, this tensor captures the output from a call
+                to `GPT2CausalLM.generate()`, i.e., tokens for both the input
+                text and the model-generated text.
+            padding_mask: A <bool>[batch_size, num_tokens] tensor indicating the
+                tokens that should be preserved during generation. This is an
+                artifact required by the `GPT2Backbone` and isn't influential on
+                the computation of this function. If omitted, this function uses
+                `keras.ops.ones()` to create a tensor of the appropriate shape.
+            scoring_mode: The type of scores to return, either "logits" or
+                "loss", both will be per input token.
+            layer_intercept_fn: An optional function for augmenting activations
+                with additional computation, for example, as part of
+                interpretability research. This function will be passed the
+                activations as its first parameter and a numeric index
+                associated with that backbone layer. This index is not an index
+                into `self.backbone.layers`. The index -1 accompanies the
+                embeddings returned by calling `self.backbone.token_embedding()`
+                on `token_ids` in the forward direction. All subsequent indexes
+                will be 0-based indices for the activations returned by each of
+                the Transformers layers in the backbone. This function must
+                return a <float>[batch_size, num_tokens, hidden_dims] tensor
+                that can be passed as an input to the next layer in the model.
+            target_ids: An <bool>[batch_size, num_tokens] tensor containing the
+                predicted tokens against which the loss should be computed. If a
+                span of tokens is provided (sequential truthy values along
+                axis=1 in the tensor), the loss will be computed as the
+                aggregate across those tokens.
+
+        Raises:
+            ValueError: If an unsupported scoring_mode is provided, or if the
+                target_ids are not provided when using ScoringMode.LOSS.
+
+        Returns:
+            The per-token scores as a tensor of size
+            <float>[batch_size, num_tokens, vocab_size] in "logits" mode, or
+            <float>[batch_size, num_tokens] in "loss" mode.
+
+        Example:
+
+        Compute gradients between embeddings and loss scores with TensorFlow:
+        ```python
+        gpt2_lm = keras_nlp.models.GPT2CausalLM.from_preset("gpt2_base_en")
+        generations = gpt2_lm.generate(
+            ["This is a", "Where are you"],
+            max_length=30
+        )
+        preprocessed = gpt2_lm.preprocessor.generate_preprocess(generations)
+        generation_ids = preprocessed["token_ids"]
+        padding_mask = preprocessed["padding_mask"]
+        target_ids = keras.ops.roll(generation_ids, shift=-1, axis=1)
+
+        embeddings = None
+        with tf.GradientTape(watch_accessed_variables=True) as tape:
+            def layer_intercept_fn(x, i):
+                if i == -1:
+                    nonlocal embeddings, tape
+                    embeddings = x
+                    tape.watch(embeddings)
+                return x
+
+            losses = gpt2_lm.score(
+                token_ids=generation_ids,
+                padding_mask=padding_mask,
+                scoring_mode="loss",
+                layer_intercept_fn=layer_intercept_fn,
+                target_ids=target_ids,
+            )
+
+        grads = tape.gradient(losses, embeddings)
+        ```
+        """
+
+        if scoring_mode not in ("logits", "loss"):
+            raise ValueError(
+                "Unsupported scoring_mode. Must be one of 'logits' or 'loss'."
+            )
+
+        if scoring_mode == "loss" and target_ids is None:
+            raise ValueError(
+                "Cannot compute loss without targets. Please provide target "
+                "token ids via the target_ids parameter."
+            )
+
+        batch_shape = ops.shape(token_ids)[:2]
+        assert len(batch_shape) == 2
+
+        if padding_mask is None:
+            padding_mask = ops.ones(shape=batch_shape)
+
+        if layer_intercept_fn is None:
+
+            def default_layer_intercept_fn(x, unused_i):
+                return x
+
+            layer_intercept_fn = default_layer_intercept_fn
+
+        token_embeddings = self.backbone.token_embedding(token_ids)
+        position_embeddings = self.backbone.position_embedding(token_embeddings)
+        summed_embeddings = self.backbone.embeddings_add(
+            (token_embeddings, position_embeddings)
+        )
+        x = layer_intercept_fn(summed_embeddings, -1)
+        x = self.backbone.embeddings_dropout(x)
+
+        for i, transformer_layer in enumerate(self.backbone.transformer_layers):
+            x = transformer_layer(x, decoder_padding_mask=padding_mask)
+            x = layer_intercept_fn(x, i)
+        x = self.backbone.layer_norm(x)
+        logits = self.backbone.token_embedding(x, reverse=True)
+
+        if scoring_mode == "logits":
+            return logits
+
+        per_token_loss_fn = keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True, reduction="none"
+        )
+        per_token_loss = per_token_loss_fn(target_ids, logits)
+        return per_token_loss

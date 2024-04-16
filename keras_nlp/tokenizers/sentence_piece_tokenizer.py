@@ -15,16 +15,12 @@
 import base64
 import binascii
 import os
-from typing import List
 
+import keras
 import tensorflow as tf
 
 from keras_nlp.api_export import keras_nlp_export
 from keras_nlp.tokenizers import tokenizer
-from keras_nlp.utils.preset_utils import check_preset_class
-from keras_nlp.utils.preset_utils import load_from_preset
-from keras_nlp.utils.python_utils import classproperty
-from keras_nlp.utils.python_utils import format_docstring
 from keras_nlp.utils.tensor_utils import assert_tf_text_installed
 from keras_nlp.utils.tensor_utils import convert_to_ragged_batch
 from keras_nlp.utils.tensor_utils import is_int_dtype
@@ -111,7 +107,7 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
     def __init__(
         self,
         proto=None,
-        sequence_length: int = None,
+        sequence_length=None,
         dtype="int32",
         **kwargs,
     ) -> None:
@@ -128,6 +124,7 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
         self.proto = None
         self.sequence_length = sequence_length
         self.set_proto(proto)
+        self.file_assets = [VOCAB_FILENAME]
 
     def save_assets(self, dir_path):
         path = os.path.join(dir_path, VOCAB_FILENAME)
@@ -175,12 +172,12 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
         # byte array as a string for saving.
         self.proto = proto_bytes
 
-    def vocabulary_size(self) -> int:
-        """Get the size of the tokenizer vocabulary."""
+    def vocabulary_size(self):
+        """Get the integer size of the tokenizer vocabulary."""
         self._check_vocabulary()
         return int(self._sentence_piece.vocab_size().numpy())
 
-    def get_vocabulary(self) -> List[str]:
+    def get_vocabulary(self):
         """Get the tokenizer vocabulary."""
         self._check_vocabulary()
         return tensor_to_list(
@@ -189,7 +186,7 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
             )
         )
 
-    def id_to_token(self, id: int) -> str:
+    def id_to_token(self, id):
         """Convert an integer id to a string token."""
         self._check_vocabulary()
         if id >= self.vocabulary_size() or id < 0:
@@ -199,7 +196,7 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
             )
         return tensor_to_list(self._sentence_piece.id_to_string(id))
 
-    def token_to_id(self, token: str) -> int:
+    def token_to_id(self, token):
         """Convert a string token to an integer id."""
         self._check_vocabulary()
         return int(self._sentence_piece.string_to_id(token).numpy())
@@ -260,66 +257,7 @@ class SentencePieceTokenizer(tokenizer.Tokenizer):
             outputs = tf.squeeze(outputs, 0)
         return outputs
 
-    @classproperty
-    def presets(cls):
-        return {}
-
-    @classmethod
-    def from_preset(
-        cls,
-        preset,
-        **kwargs,
-    ):
-        """Instantiate {{model_name}} tokenizer from preset vocabulary.
-
-        Args:
-            preset: string. Must be one of "{{preset_names}}".
-
-        Examples:
-        ```python
-        # Load a preset tokenizer.
-        tokenizer = {{model_name}}.from_preset("{{example_preset_name}}")
-
-        # Tokenize some input.
-        tokenizer("The quick brown fox tripped.")
-
-        # Detokenize some input.
-        tokenizer.detokenize([5, 6, 7, 8, 9])
-        ```
-        """
-        # We support short IDs for official presets, e.g. `"bert_base_en"`.
-        # Map these to a Kaggle Models handle.
-        if preset in cls.presets:
-            preset = cls.presets[preset]["kaggle_handle"]
-
-        config_file = "tokenizer.json"
-        check_preset_class(preset, cls, config_file=config_file)
-        return load_from_preset(
-            preset,
-            config_file=config_file,
-            config_overrides=kwargs,
+    def compute_output_spec(self, input_spec):
+        return keras.KerasTensor(
+            input_spec.shape + (self.sequence_length,), dtype=self.compute_dtype
         )
-
-    def __init_subclass__(cls, **kwargs):
-        # Use __init_subclass__ to setup a correct docstring for from_preset.
-        super().__init_subclass__(**kwargs)
-
-        # If the subclass does not define from_preset, assign a wrapper so that
-        # each class can have a distinct docstring.
-        if "from_preset" not in cls.__dict__:
-
-            def from_preset(calling_cls, *args, **kwargs):
-                return super(cls, calling_cls).from_preset(*args, **kwargs)
-
-            cls.from_preset = classmethod(from_preset)
-
-        # Format and assign the docstring unless the subclass has overridden it.
-        if cls.from_preset.__doc__ is None:
-            cls.from_preset.__func__.__doc__ = (
-                SentencePieceTokenizer.from_preset.__doc__
-            )
-            format_docstring(
-                model_name=cls.__name__,
-                example_preset_name=next(iter(cls.presets), ""),
-                preset_names='", "'.join(cls.presets),
-            )(cls.from_preset.__func__)
