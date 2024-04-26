@@ -143,5 +143,17 @@ classifier_presets = {
             "model_card": "https://github.com/google-research/bert/blob/master/README.md",
         },
         "kaggle_handle": "kaggle://keras/bert/keras/bert_tiny_en_uncased_sst2/3",
-    }
+    },
+    "bert_tiny_en_uncased_imdb": {
+        "metadata": {
+            "description": (
+                "The bert_tiny_en_uncased backbone model fine-tuned on the IMDB sentiment analysis dataset."
+            ),
+            "params": 4386178,
+            "official_name": "BERT",
+            "path": "bert",
+            "model_card": "https://github.com/google-research/bert/blob/master/README.md",
+        },
+        "kaggle_handle": "kaggle://keras/bert/keras/bert_tiny_en_uncased_imdb/1",
+    },
 }
