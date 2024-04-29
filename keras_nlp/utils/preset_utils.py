@@ -91,6 +91,7 @@ def list_subclasses(cls):
 
 
 def get_file(preset, path):
+    print("get_file: ", path)
     """Download a preset file in necessary and return the local path."""
     # TODO: Add tests for FileNotFound exceptions.
     if not isinstance(preset, str):
@@ -193,6 +194,7 @@ def get_file(preset, path):
 
 
 def check_file_exists(preset, path):
+    print("check_file_exists: ", path)
     try:
         get_file(preset, path)
     except FileNotFoundError:
