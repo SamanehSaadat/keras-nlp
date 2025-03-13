@@ -21,3 +21,7 @@ build/
 
 venv/
 .DS_Store
+
+# ssaadat@
+.devcontainer/setup.sh
+
